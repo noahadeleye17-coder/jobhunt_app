@@ -1,0 +1,282 @@
+diff --git a/jobhunt/cli.py b/jobhunt/cli.py
+index 6404d8c..2ade769 100644
+--- a/jobhunt/cli.py
++++ b/jobhunt/cli.py
+@@ -7,7 +7,7 @@ from typing import Sequence
+ 
+ from .config import ConfigError, load_config
+ from .email_delivery import EmailDeliveryError, send_digest
+-from .fetchers import fetch_all
++from .fetchers import fetch_all, skipped_count
+ from .models import Job, Profile
+ from .storage import close_missing, db, store
+ 
+@@ -52,6 +52,14 @@ def pick(
+     return rows
+ 
+ 
++def mark(connection: sqlite3.Connection, column: str, rows: Sequence[sqlite3.Row]) -> None:
++    if column not in {"notified", "email_notified"}:
++        raise ValueError(f"Unsupported notification column: {column}")
++    if rows:
++        placeholders = ",".join("?" for _ in rows)
++        connection.execute(f"UPDATE jobs SET {column}=1 WHERE id IN ({placeholders})", [row["id"] for row in rows])
++
++
+ def cmd_check() -> None:
+     _, companies = load_config(ROOT)
+     for (source, name), (_, result) in sorted(fetch_all(companies).items()):
+@@ -91,7 +99,11 @@ def cmd_run() -> None:
+         )
+         text = render(rows, f"Job digest {today}")
+         email_text = render(email_rows, f"Job digest {today}")
+-        (ROOT / f"digest-{today}.md").write_text(text, encoding="utf-8")
++        if rows:
++            path = ROOT / f"digest-{today}.md"
++            earlier = path.read_text(encoding="utf-8") + "\n---\n\n" if path.exists() else ""
++            path.write_text(earlier + text, encoding="utf-8")
++        mark(connection, "notified", rows)
+         connection.commit()
+     except Exception:
+         connection.rollback()
+@@ -99,29 +111,32 @@ def cmd_run() -> None:
+     finally:
+         connection.close()
+ 
+-    email_sent = send_digest(f"Job digest {today}", email_text)
+-    connection = db(ROOT)
++    email_sent, email_error = False, None
+     try:
+-        delivery_rows = email_rows if email_sent else rows
+-        if delivery_rows:
+-            column = "email_notified" if email_sent else "notified"
+-            placeholders = ",".join("?" for _ in delivery_rows)
+-            connection.execute(
+-                f"UPDATE jobs SET {column}=1 WHERE id IN ({placeholders})",
+-                [row["id"] for row in delivery_rows],
+-            )
+-        connection.commit()
+-    except Exception:
+-        connection.rollback()
+-        raise
+-    finally:
+-        connection.close()
++        email_sent = send_digest(f"Job digest {today}", email_text)
++    except EmailDeliveryError as exc:
++        email_error = exc
++    if email_sent:
++        connection = db(ROOT)
++        try:
++            mark(connection, "email_notified", email_rows)
++            connection.commit()
++        except Exception:
++            connection.rollback()
++            raise
++        finally:
++            connection.close()
+ 
+     print(text)
+     print(f"\n{len(good_sources)} sources ok, {len(bad_sources)} failed | {kept} matching jobs seen | {closed} closed since last run")
+-    print(f"Email: {'sent' if email_sent else 'not configured'}")
++    skipped = skipped_count()
++    if skipped:
++        print(f"{skipped} malformed postings skipped")
++    print(f"Email: {'sent' if email_sent else 'FAILED' if email_error else 'not configured'}")
+     for failure in bad_sources:
+         print("  FAILED", failure)
++    if email_error:
++        sys.exit(f"Email delivery error: {email_error}")
+ 
+ 
+ def cmd_top(limit: int) -> None:
+@@ -134,6 +149,9 @@ def cmd_top(limit: int) -> None:
+ 
+ 
+ def main() -> None:
++    for stream in (sys.stdout, sys.stderr):
++        if hasattr(stream, "reconfigure"):
++            stream.reconfigure(encoding="utf-8", errors="replace")
+     parser = argparse.ArgumentParser()
+     subcommands = parser.add_subparsers(dest="command", required=True)
+     subcommands.add_parser("check", help="test every company source without database writes")
+diff --git a/jobhunt/config.py b/jobhunt/config.py
+index b7fba02..0d03f30 100644
+--- a/jobhunt/config.py
++++ b/jobhunt/config.py
+@@ -1,9 +1,11 @@
+ import json
+ import re
++import sys
+ from pathlib import Path
+ from typing import Any
+ 
+ from .models import Company, Profile
++from .scoring import VOCAB
+ 
+ SUPPORTED_ATS = frozenset({"greenhouse", "lever", "ashby"})
+ 
+@@ -40,6 +42,9 @@ def load_config(root: Path) -> tuple[Profile, list[Company]]:
+     core = _string_list(raw_profile.get("core"), "core", profile_path)
+     if not core.issubset(skills):
+         raise ConfigError(f"{profile_path}: every core skill must also appear in skills")
++    unknown = sorted(skills - VOCAB.keys())
++    if unknown:
++        print(f"Warning: {profile_path}: scorer cannot detect these skills: {', '.join(unknown)}", file=sys.stderr)
+ 
+     exclude_titles = raw_profile.get("exclude_titles")
+     prefer_titles = raw_profile.get("prefer_titles")
+diff --git a/jobhunt/fetchers.py b/jobhunt/fetchers.py
+index 58301d1..e3f6a28 100644
+--- a/jobhunt/fetchers.py
++++ b/jobhunt/fetchers.py
+@@ -3,6 +3,7 @@ import datetime as dt
+ import html
+ import re
+ import threading
++from collections.abc import Callable, Iterable
+ from typing import Any
+ 
+ import requests
+@@ -14,6 +15,8 @@ from .models import Company, Job
+ UA = {"User-Agent": "jobhunt/0.2 (personal job search)"}
+ INTERN = re.compile(r"\bintern(ship)?s?\b|trainee|apprentice|new grad|graduate", re.I)
+ _thread_local = threading.local()
++_skip_lock = threading.Lock()
++_skipped = 0
+ 
+ 
+ def _session() -> requests.Session:
+@@ -86,78 +89,94 @@ def make_job(
+     )
+ 
+ 
++def skipped_count() -> int:
++    return _skipped
++
++
++def _build(rows: Iterable[Any], build: Callable[[Any], Job]) -> list[Job]:
++    """Build jobs row by row; skip malformed postings, but fail the source if none are usable."""
++    global _skipped
++    rows = list(rows)
++    jobs: list[Job] = []
++    for row in rows:
++        try:
++            jobs.append(build(row))
++        except (AttributeError, KeyError, TypeError, ValueError):
++            with _skip_lock:
++                _skipped += 1
++    if rows and not jobs:
++        raise ValueError("every posting in the response was malformed")
++    return jobs
++
++
+ def greenhouse(company: Company) -> list[Job]:
+     data = get(
+         f"https://boards-api.greenhouse.io/v1/boards/{company.slug}/jobs",
+         params={"content": "true"},
+     )
+-    return [
+-        make_job(
++    return _build(
++        data["jobs"],
++        lambda job: make_job(
+             company, "greenhouse", job["id"], job["title"],
+             (job.get("location") or {}).get("name"), None, job["absolute_url"],
+             job.get("updated_at"), job.get("content"),
+-        )
+-        for job in data["jobs"]
+-    ]
++        ),
++    )
+ 
+ 
+ def lever(company: Company) -> list[Job]:
+-    result = []
+-    for job in get(f"https://api.lever.co/v0/postings/{company.slug}", params={"mode": "json"}):
++    def build(job: dict[str, Any]) -> Job:
+         categories = job.get("categories") or {}
+         timestamp = job.get("createdAt")
+         posted = (
+             dt.datetime.fromtimestamp(timestamp / 1000, dt.timezone.utc).isoformat()
+             if timestamp else None
+         )
+-        result.append(
+-            make_job(
+-                company, "lever", job["id"], job["text"], categories.get("location"),
+-                job.get("workplaceType") == "remote", job["hostedUrl"], posted,
+-                job.get("descriptionPlain"), categories.get("commitment", ""),
+-            )
++        return make_job(
++            company, "lever", job["id"], job["text"], categories.get("location"),
++            job.get("workplaceType") == "remote", job["hostedUrl"], posted,
++            job.get("descriptionPlain"), categories.get("commitment", ""),
+         )
+-    return result
++
++    data = get(f"https://api.lever.co/v0/postings/{company.slug}", params={"mode": "json"})
++    if not isinstance(data, list):
++        raise ValueError("unexpected Lever response shape")
++    return _build(data, build)
+ 
+ 
+ def ashby(company: Company) -> list[Job]:
+     data = get(f"https://api.ashbyhq.com/posting-api/job-board/{company.slug}")
+-    return [
+-        make_job(
++    return _build(
++        data["jobs"],
++        lambda job: make_job(
+             company, "ashby", job["id"], job["title"], job.get("location"),
+             job.get("isRemote"), job["jobUrl"], job.get("publishedAt"),
+             job.get("descriptionPlain"), job.get("employmentType") or "",
+-        )
+-        for job in data["jobs"]
+-    ]
++        ),
++    )
+ 
+ 
+ def remoteok(_: None) -> list[Job]:
+-    result = []
+-    for job in get("https://remoteok.com/api")[1:]:
+-        if job.get("position"):
+-            company = Company(job.get("company", ""), "remoteok", "*", "board", "remoteok:*")
+-            result.append(
+-                make_job(
+-                    company, "remoteok", job["id"], job["position"], job.get("location"),
+-                    True, job["url"], job.get("date"), job.get("description"),
+-                )
+-            )
+-    return result
++    def build(job: dict[str, Any]) -> Job:
++        company = Company(job.get("company", ""), "remoteok", "*", "board", "remoteok:*")
++        return make_job(
++            company, "remoteok", job["id"], job["position"], job.get("location"),
++            True, job["url"], job.get("date"), job.get("description"),
++        )
++
++    return _build([job for job in get("https://remoteok.com/api")[1:] if job.get("position")], build)
+ 
+ 
+ def remotive(_: None) -> list[Job]:
+-    result = []
+-    for job in get("https://remotive.com/api/remote-jobs", params={"category": "software-dev"})["jobs"]:
++    def build(job: dict[str, Any]) -> Job:
+         company = Company(job["company_name"], "remotive", "*", "board", "remotive:*")
+-        result.append(
+-            make_job(
+-                company, "remotive", job["id"], job["title"], job.get("candidate_required_location"),
+-                True, job["url"], job.get("publication_date"), job.get("description"),
+-                job.get("job_type", ""),
+-            )
++        return make_job(
++            company, "remotive", job["id"], job["title"], job.get("candidate_required_location"),
++            True, job["url"], job.get("publication_date"), job.get("description"),
++            job.get("job_type", ""),
+         )
+-    return result
++
++    return _build(get("https://remotive.com/api/remote-jobs", params={"category": "software-dev"})["jobs"], build)
+ 
+ 
+ FETCHERS = {"greenhouse": greenhouse, "lever": lever, "ashby": ashby}

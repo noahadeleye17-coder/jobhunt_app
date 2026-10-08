@@ -1,0 +1,1 @@
+"""Job-hunt scraper application."""
