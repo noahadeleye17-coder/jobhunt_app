@@ -1,0 +1,39 @@
+{
+  "skills": [
+    "javascript",
+    "typescript",
+    "python",
+    "go",
+    "rust",
+    "react",
+    "next.js",
+    "tailwind",
+    "node.js",
+    "express",
+    "mongodb",
+    "postgresql",
+    "rest",
+    "jwt",
+    "oauth",
+    "docker",
+    "github actions",
+    "cloudinary",
+    "machine learning",
+    "llm",
+    "flutter"
+  ],
+  "core": [
+    "javascript",
+    "typescript",
+    "python",
+    "react",
+    "next.js",
+    "node.js",
+    "express",
+    "mongodb",
+    "postgresql"
+  ],
+  "exclude_titles": "\\b(senior|sr\\.?|staff|principal|lead|manager|director|architect|head of|vp|vice president)\\b",
+  "prefer_titles": "intern(ship)?|trainee|apprentice|new grad|graduate|entry[- ]level|junior|associate|software engineer|software developer|backend|back-end|full[\\s-]?stack|frontend|front-end|web developer|machine learning|\\bAI\\b|artificial intelligence|data scientist|NLP|\\bML\\b",
+  "min_score": 45
+}

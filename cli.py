@@ -11,7 +11,7 @@ from .fetchers import fetch_all, skipped_count
 from .models import Job, Profile
 from .storage import close_missing, db, store
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 
 
 def render(rows: Sequence[sqlite3.Row], title: str) -> str:
